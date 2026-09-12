@@ -1,19 +1,28 @@
 """MaxxVoice HTTP boundary.
 
-The router exposes deterministic planning plus explicit Article -> Podcast
-execution. Workflow execution is opt-in: planning never generates audio, while
-rendering executes only the supplied article and synthesis parameters.
+The router exposes deterministic planning plus explicit workflow execution.
+Workflow requests are represented as jobs so long-running speech generation
+does not block the HTTP request until rendering completes.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+import asyncio
+
+from fastapi import APIRouter, HTTPException, status as http_status
 from pydantic import BaseModel, Field
 
 from maxxvoice.capabilities import VoiceCapabilityService
-from maxxvoice.orchestration import MaxxVoicePlanner
+from maxxvoice.orchestration import (
+    InMemoryWorkflowJobStore,
+    MaxxVoicePlanner,
+    MaxxVoiceWorkflowJobRunner,
+)
 from maxxvoice.workflows import ArticlePodcastPlanner, ArticlePodcastRenderer
 
 router = APIRouter(prefix="/maxxvoice", tags=["maxxvoice"])
+
+_workflow_store = InMemoryWorkflowJobStore()
+_workflow_runner = MaxxVoiceWorkflowJobRunner(_workflow_store)
 
 
 class PlanRequest(BaseModel):
@@ -48,9 +57,12 @@ def plan(request: PlanRequest):
     return MaxxVoicePlanner().plan(request.goal, context=request.context).to_dict()
 
 
-@router.post("/workflows/article-podcast")
+@router.post(
+    "/workflows/article-podcast",
+    status_code=http_status.HTTP_202_ACCEPTED,
+)
 async def article_podcast(request: ArticlePodcastRequest):
-    """Plan and render an article as a single-narrator podcast."""
+    """Create an Article -> Podcast job and dispatch rendering in the background."""
     podcast_plan = ArticlePodcastPlanner().plan(
         request.article,
         title=request.title,
@@ -59,14 +71,38 @@ async def article_podcast(request: ArticlePodcastRequest):
         chunk_words=request.chunk_words,
     )
 
-    result = await ArticlePodcastRenderer().render(
-        podcast_plan,
-        language=request.language,
-        voice=request.voice,
-        reference_audio=request.reference_audio,
-        synthesis_options=request.synthesis_options,
-    )
+    async def operation():
+        result = await ArticlePodcastRenderer().render(
+            podcast_plan,
+            language=request.language,
+            voice=request.voice,
+            reference_audio=request.reference_audio,
+            synthesis_options=request.synthesis_options,
+        )
+        payload = result.to_dict()
+        payload["plan"] = podcast_plan.to_dict()
+        return payload
 
-    payload = result.to_dict()
-    payload["plan"] = podcast_plan.to_dict()
-    return payload
+    job = _workflow_runner.create("article-podcast")
+
+    async def dispatch() -> None:
+        await _workflow_runner.run(
+            "article-podcast",
+            operation,
+            job_id=job.id,
+        )
+
+    asyncio.create_task(dispatch())
+    return job.to_dict()
+
+
+@router.get("/jobs/{job_id}")
+def workflow_job(job_id: str):
+    """Return the current state/result of a MaxxVoice workflow job."""
+    job = _workflow_store.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown workflow job: {job_id}",
+        )
+    return job.to_dict()
