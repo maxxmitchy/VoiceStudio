@@ -16,12 +16,14 @@ from maxxvoice.capabilities import VoiceCapabilityService
 from maxxvoice.orchestration import MaxxVoicePlanner, MaxxVoiceWorkflowJobRunner
 from maxxvoice.orchestration.jobs import JobStatus
 from maxxvoice.orchestration.sqlite_jobs import SQLiteWorkflowJobStore
+from maxxvoice.orchestration.sqlite_workflow_steps import SQLiteWorkflowStepStore
 from maxxvoice.workflows import ArticlePodcastPlanner, ArticlePodcastRenderer
 
 router = APIRouter(prefix="/maxxvoice", tags=["maxxvoice"])
 
 _db_path = os.getenv("MAXXVOICE_JOB_DB", ".data/maxxvoice_jobs.sqlite3")
 _workflow_store = SQLiteWorkflowJobStore(_db_path)
+_step_store = SQLiteWorkflowStepStore(_db_path)
 _workflow_runner = MaxxVoiceWorkflowJobRunner(_workflow_store)
 
 
@@ -49,6 +51,7 @@ def status():
         "version": "1",
         "mode": "orchestration-foundation",
         "job_store": "sqlite",
+        "step_checkpoints": "sqlite",
         "capabilities": VoiceCapabilityService.capabilities(),
     }
 
@@ -67,6 +70,15 @@ async def article_podcast(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     """Create an Article -> Podcast job and dispatch rendering in the background."""
+    # Fast path for normal retries. SQLite's unique constraint remains the
+    # final race-safety boundary when two requests arrive simultaneously.
+    if idempotency_key:
+        existing = _workflow_store.get_by_idempotency_key(
+            "article-podcast", idempotency_key.strip()
+        )
+        if existing is not None:
+            return _job_response(existing)
+
     podcast_plan = ArticlePodcastPlanner().plan(
         request.article,
         title=request.title,
@@ -78,12 +90,19 @@ async def article_podcast(
     job = _workflow_runner.create(
         "article-podcast",
         payload=request.model_dump(mode="json"),
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key.strip() if idempotency_key else None,
     )
 
-    # An idempotent retry must not schedule the same work twice.
+    # Materialize every planned segment as a pending durable checkpoint.
+    for segment in podcast_plan.segments:
+        if _step_store.get(job.id, segment.id) is None:
+            from maxxvoice.orchestration.sqlite_workflow_steps import WorkflowStepCheckpoint
+            _step_store.upsert(WorkflowStepCheckpoint(job.id, segment.id))
+
+    # An idempotent retry must not schedule the same work twice when the job
+    # already progressed or completed.
     if job.status is not JobStatus.QUEUED:
-        return job.to_dict()
+        return _job_response(job)
 
     async def operation():
         result = await ArticlePodcastRenderer().render(
@@ -92,6 +111,8 @@ async def article_podcast(
             voice=request.voice,
             reference_audio=request.reference_audio,
             synthesis_options=request.synthesis_options,
+            checkpoint_store=_step_store,
+            job_id=job.id,
         )
         payload = result.to_dict()
         payload["plan"] = podcast_plan.to_dict()
@@ -105,16 +126,32 @@ async def article_podcast(
         )
 
     asyncio.create_task(dispatch())
-    return job.to_dict()
+    return _job_response(job)
 
 
 @router.get("/jobs/{job_id}")
 def workflow_job(job_id: str):
-    """Return the current state/result of a MaxxVoice workflow job."""
+    """Return current job state plus durable segment progress."""
     job = _workflow_store.get(job_id)
     if job is None:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Unknown workflow job: {job_id}",
         )
-    return job.to_dict()
+    return _job_response(job)
+
+
+def _job_response(job):
+    payload = job.to_dict()
+    steps = _step_store.list(job.id)
+    completed = sum(step.status == "completed" for step in steps)
+    total = len(steps)
+    running = next((step.step_id for step in steps if step.status == "running"), None)
+    payload["progress"] = {
+        "completed": completed,
+        "total": total,
+        "percent": round((completed / total) * 100, 1) if total else 100.0,
+        "current_step": running,
+        "steps": [step.to_dict() for step in steps],
+    }
+    return payload
