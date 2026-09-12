@@ -98,7 +98,21 @@ class MaxxVoiceWorkflowJobRunner:
         *,
         job_id: Optional[str] = None,
     ) -> WorkflowJob:
-        job = self.create(workflow, job_id=job_id)
+        if job_id is not None:
+            job = self.store.get(job_id)
+            if job is None:
+                raise WorkflowJobError(f"Unknown workflow job: {job_id}")
+            if job.workflow != workflow:
+                raise WorkflowJobError(
+                    f"Workflow job {job_id} belongs to {job.workflow!r}, not {workflow!r}"
+                )
+            if job.status is not JobStatus.QUEUED:
+                raise WorkflowJobError(
+                    f"Workflow job {job_id} is already {job.status.value}"
+                )
+        else:
+            job = self.create(workflow)
+
         job.status = JobStatus.RUNNING
         job.started_at = _now()
 
