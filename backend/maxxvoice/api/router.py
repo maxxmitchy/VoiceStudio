@@ -16,12 +16,13 @@ from maxxvoice.capabilities import VoiceCapabilityService
 from maxxvoice.orchestration import MaxxVoicePlanner, MaxxVoiceWorkflowJobRunner
 from maxxvoice.orchestration.jobs import JobStatus
 from maxxvoice.orchestration.sqlite_jobs import SQLiteWorkflowJobStore
-from maxxvoice.orchestration.sqlite_workflow_steps import SQLiteWorkflowStepStore
+from maxxvoice.orchestration.sqlite_workflow_steps import SQLiteWorkflowStepStore, WorkflowStepCheckpoint
 from maxxvoice.workflows import ArticlePodcastPlanner, ArticlePodcastRenderer
 
 router = APIRouter(prefix="/maxxvoice", tags=["maxxvoice"])
 
 _db_path = os.getenv("MAXXVOICE_JOB_DB", ".data/maxxvoice_jobs.sqlite3")
+_artifact_dir = os.getenv("MAXXVOICE_ARTIFACT_DIR", ".data/maxxvoice_artifacts")
 _workflow_store = SQLiteWorkflowJobStore(_db_path)
 _step_store = SQLiteWorkflowStepStore(_db_path)
 _workflow_runner = MaxxVoiceWorkflowJobRunner(_workflow_store)
@@ -52,6 +53,7 @@ def status():
         "mode": "orchestration-foundation",
         "job_store": "sqlite",
         "step_checkpoints": "sqlite",
+        "segment_artifacts": "validated-wav",
         "capabilities": VoiceCapabilityService.capabilities(),
     }
 
@@ -61,71 +63,94 @@ def plan(request: PlanRequest):
     return MaxxVoicePlanner().plan(request.goal, context=request.context).to_dict()
 
 
-@router.post(
-    "/workflows/article-podcast",
-    status_code=http_status.HTTP_202_ACCEPTED,
-)
-async def article_podcast(
-    request: ArticlePodcastRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-):
-    """Create an Article -> Podcast job and dispatch rendering in the background."""
-    # Fast path for normal retries. SQLite's unique constraint remains the
-    # final race-safety boundary when two requests arrive simultaneously.
-    if idempotency_key:
-        existing = _workflow_store.get_by_idempotency_key(
-            "article-podcast", idempotency_key.strip()
-        )
-        if existing is not None:
-            return _job_response(existing)
-
-    podcast_plan = ArticlePodcastPlanner().plan(
-        request.article,
-        title=request.title,
-        target_duration_minutes=request.target_duration_minutes,
-        narrator=request.narrator,
-        chunk_words=request.chunk_words,
+def _build_plan(payload: dict):
+    return ArticlePodcastPlanner().plan(
+        payload["article"],
+        title=payload.get("title", "Untitled Podcast"),
+        target_duration_minutes=payload.get("target_duration_minutes", 10.0),
+        narrator=payload.get("narrator", "narrator"),
+        chunk_words=payload.get("chunk_words", 120),
     )
 
-    job = _workflow_runner.create(
-        "article-podcast",
-        payload=request.model_dump(mode="json"),
-        idempotency_key=idempotency_key.strip() if idempotency_key else None,
-    )
 
-    # Materialize every planned segment as a pending durable checkpoint.
-    for segment in podcast_plan.segments:
-        if _step_store.get(job.id, segment.id) is None:
-            from maxxvoice.orchestration.sqlite_workflow_steps import WorkflowStepCheckpoint
-            _step_store.upsert(WorkflowStepCheckpoint(job.id, segment.id))
-
-    # An idempotent retry must not schedule the same work twice when the job
-    # already progressed or completed.
-    if job.status is not JobStatus.QUEUED:
-        return _job_response(job)
+async def _dispatch_article_podcast(job_id: str, podcast_plan) -> None:
+    job = _workflow_store.get(job_id)
+    if job is None:
+        return
+    request_payload = job.payload
 
     async def operation():
         result = await ArticlePodcastRenderer().render(
             podcast_plan,
-            language=request.language,
-            voice=request.voice,
-            reference_audio=request.reference_audio,
-            synthesis_options=request.synthesis_options,
+            language=request_payload.get("language"),
+            voice=request_payload.get("voice"),
+            reference_audio=request_payload.get("reference_audio"),
+            synthesis_options=request_payload.get("synthesis_options") or {},
             checkpoint_store=_step_store,
-            job_id=job.id,
+            job_id=job_id,
+            artifact_dir=_artifact_dir,
         )
         payload = result.to_dict()
         payload["plan"] = podcast_plan.to_dict()
         return payload
 
-    async def dispatch() -> None:
-        await _workflow_runner.run(
-            "article-podcast",
-            operation,
-            job_id=job.id,
-        )
+    await _workflow_runner.run("article-podcast", operation, job_id=job_id)
 
-    asyncio.create_task(dispatch())
+
+@router.post("/workflows/article-podcast", status_code=http_status.HTTP_202_ACCEPTED)
+async def article_podcast(
+    request: ArticlePodcastRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    """Create an Article -> Podcast job and dispatch rendering in the background."""
+    normalized_key = idempotency_key.strip() if idempotency_key else None
+    if normalized_key:
+        existing = _workflow_store.get_by_idempotency_key("article-podcast", normalized_key)
+        if existing is not None:
+            return _job_response(existing)
+
+    podcast_plan = _build_plan(request.model_dump(mode="json"))
+    job = _workflow_runner.create(
+        "article-podcast",
+        payload=request.model_dump(mode="json"),
+        idempotency_key=normalized_key,
+    )
+
+    for segment in podcast_plan.segments:
+        if _step_store.get(job.id, segment.id) is None:
+            _step_store.upsert(WorkflowStepCheckpoint(job.id, segment.id))
+
+    if job.status is not JobStatus.QUEUED:
+        return _job_response(job)
+
+    asyncio.create_task(_dispatch_article_podcast(job.id, podcast_plan))
+    return _job_response(job)
+
+
+@router.post("/jobs/{job_id}/resume", status_code=http_status.HTTP_202_ACCEPTED)
+async def resume_workflow_job(job_id: str):
+    """Resume a failed Article -> Podcast job using only validated completed segments."""
+    job = _workflow_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Unknown workflow job: {job_id}")
+    if job.workflow != "article-podcast":
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Resume is currently supported for article-podcast jobs only.")
+    if job.status is JobStatus.RUNNING:
+        return _job_response(job)
+    if job.status is JobStatus.COMPLETED:
+        return _job_response(job)
+    if job.status is not JobStatus.FAILED:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=f"Job is {job.status.value}; only failed jobs can be resumed.")
+
+    podcast_plan = _build_plan(job.payload)
+    job.status = JobStatus.QUEUED
+    job.error = None
+    job.completed_at = None
+    _workflow_store.update(job)
+    for segment in podcast_plan.segments:
+        if _step_store.get(job.id, segment.id) is None:
+            _step_store.upsert(WorkflowStepCheckpoint(job.id, segment.id))
+    asyncio.create_task(_dispatch_article_podcast(job.id, podcast_plan))
     return _job_response(job)
 
 
@@ -134,10 +159,7 @@ def workflow_job(job_id: str):
     """Return current job state plus durable segment progress."""
     job = _workflow_store.get(job_id)
     if job is None:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown workflow job: {job_id}",
-        )
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Unknown workflow job: {job_id}")
     return _job_response(job)
 
 
