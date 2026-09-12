@@ -33,7 +33,7 @@ async def test_runner_records_completed_workflow():
         job_id="job-run-1",
     )
 
-    assert job.status == JobStatus.FAILED
+    assert job.status == JobStatus.COMPLETED
     assert job.steps[0].status == StepStatus.COMPLETED
     assert job.steps[1].status == StepStatus.COMPLETED
     assert job.completed_at is not None
