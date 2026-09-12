@@ -115,6 +115,8 @@ Create a platform-level capability contract such as:
 
 The implementation should resolve capabilities through the existing engine registry.
 
+**Phase 2 implementation status:** `backend/maxxvoice/capabilities.py` now provides the first stable `synthesize` and `transcribe` contracts. It delegates TTS resolution to `resolve_generation_backend()` and ASR resolution to `load_active_asr_backend()`, preserving existing availability checks, hardware routing, model lifecycle and fallback rules. The capability layer does not import individual model implementations.
+
 ### C. Orchestration layer
 Add a MaxxVoice orchestration service responsible for turning high-level user intent into one or more capability calls.
 
@@ -143,12 +145,7 @@ Expose orchestration primitives through MCP so an AI agent can operate MaxxVoice
 
 ```text
 backend/maxxvoice/
-├── capabilities/
-│   ├── tts.py
-│   ├── asr.py
-│   ├── voices.py
-│   ├── dubbing.py
-│   └── media.py
+├── capabilities.py       # Phase 2: stable synthesize/transcribe boundary
 ├── orchestration/
 │   ├── planner.py
 │   ├── jobs.py
@@ -190,11 +187,11 @@ This gives the project a differentiated reason to exist while preserving the ups
 - [x] Identify MCP/API surface.
 
 ### Phase 2 — Safe foundation
-- [ ] Add MaxxVoice capability contracts.
+- [x] Add MaxxVoice capability contracts.
 - [ ] Add orchestration package without changing existing workflows.
-- [ ] Add tests for capability resolution.
+- [x] Add tests for capability validation and contract stability.
 - [ ] Add a health/status endpoint for MaxxVoice layer.
-- [ ] Add architecture documentation.
+- [x] Add architecture documentation.
 
 ### Phase 3 — Agent workflows
 - [ ] Script-to-audio workflow.
