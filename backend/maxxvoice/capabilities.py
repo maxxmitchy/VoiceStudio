@@ -2,8 +2,8 @@
 
 The key design rule is adapter ownership: this module never imports or selects
 individual TTS/ASR model implementations. It resolves through VoiceStudio's
-existing registries, so new engines remain replaceable and upstream workflow
-behaviour is preserved.
+existing engine registries, so new engines remain replaceable and upstream
+workflow behaviour is preserved.
 
 This first capability slice deliberately covers synthesis and transcription.
 Higher-level operations (clone, design, dubbing and render) should compose these
@@ -59,6 +59,7 @@ class VoiceCapabilityService:
 
         from services.tts_backend import resolve_generation_backend
 
+        backend = None
         try:
             backend = await resolve_generation_backend(
                 require_cloning=bool(request.reference_audio),
@@ -82,8 +83,9 @@ class VoiceCapabilityService:
         except (ValueError, CapabilityError):
             raise
         except Exception as exc:  # noqa: BLE001 — preserve one product boundary
+            engine_id = getattr(backend, "id", "unknown")
             raise CapabilityError(
-                f"Synthesis failed using TTS engine '{getattr(backend, 'id', 'unknown')}': {exc}"
+                f"Synthesis failed using TTS engine '{engine_id}': {exc}"
             ) from exc
 
         return {
@@ -100,6 +102,7 @@ class VoiceCapabilityService:
 
         from services.asr_backend import load_active_asr_backend
 
+        backend = None
         try:
             backend = load_active_asr_backend()
             result = backend.transcribe(
@@ -110,8 +113,9 @@ class VoiceCapabilityService:
         except (ValueError, CapabilityError):
             raise
         except Exception as exc:  # noqa: BLE001 — preserve one product boundary
+            engine_id = getattr(backend, "id", "unknown")
             raise CapabilityError(
-                f"Transcription failed using ASR engine '{getattr(backend, 'id', 'unknown')}': {exc}"
+                f"Transcription failed using ASR engine '{engine_id}': {exc}"
             ) from exc
 
         result = dict(result or {})
@@ -119,7 +123,7 @@ class VoiceCapabilityService:
         result.setdefault("chunks", [])
         result.setdefault("segments", [])
         result["engine_id"] = backend.id
-        result["model_id"] = backend.model_identity() if hasattr(backend, "model_identity") else None
+        result["model_id"] = getattr(backend, "model_identity", lambda: None)()
         return result
 
     @staticmethod
