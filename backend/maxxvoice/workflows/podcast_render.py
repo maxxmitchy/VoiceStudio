@@ -11,7 +11,6 @@ from maxxvoice.workflows.article_podcast import PodcastPlan
 
 class SegmentCheckpointStore(Protocol):
     """Minimal durable checkpoint contract used by the renderer."""
-
     def get(self, job_id: str, step_id: str) -> Any: ...
     def mark_running(self, job_id: str, step_id: str) -> Any: ...
     def mark_completed(self, job_id: str, step_id: str, artifact: dict[str, Any] | None = None) -> Any: ...
@@ -31,16 +30,7 @@ class PodcastRenderResult:
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "title": self.title,
-            "status": self.status,
-            "duration_seconds": self.duration_seconds,
-            "sample_rate": self.sample_rate,
-            "output_path": self.output_path,
-            "segments": [{k: v for k, v in item.items() if k != "artifact"} for item in self.segments],
-            "warnings": self.warnings,
-            "errors": self.errors,
-        }
+        return {"title": self.title, "status": self.status, "duration_seconds": self.duration_seconds, "sample_rate": self.sample_rate, "output_path": self.output_path, "segments": [{k: v for k, v in item.items() if k != "artifact"} for item in self.segments], "warnings": self.warnings, "errors": self.errors}
 
 
 class ArticlePodcastRenderer:
@@ -71,28 +61,18 @@ class ArticlePodcastRenderer:
 
     @staticmethod
     def _segment_path(job_id: str, segment_id: str, artifact_dir: str | Path | None) -> Path:
-        root = Path(artifact_dir or ".data/maxxvoice_artifacts")
-        return root / job_id / f"{segment_id}.wav"
+        return Path(artifact_dir or ".data/maxxvoice_artifacts") / job_id / f"{segment_id}.wav"
 
     @staticmethod
     def _persist_and_validate(path: Path, audio: Any, sample_rate: int) -> dict[str, Any]:
-        """Atomically publish a segment and independently verify the resulting WAV."""
         from services.audio_io import atomic_save_wav
         import soundfile as sf
-
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_save_wav(str(path), audio, sample_rate)
         info = sf.info(str(path))
         if info.frames <= 0 or info.samplerate != int(sample_rate) or info.channels <= 0:
             raise ValueError("Persisted segment artifact failed validation.")
-        return {
-            "path": str(path),
-            "format": "wav",
-            "sample_rate": int(info.samplerate),
-            "samples": int(info.frames),
-            "channels": int(info.channels),
-            "size_bytes": path.stat().st_size,
-        }
+        return {"path": str(path), "format": "wav", "sample_rate": int(info.samplerate), "samples": int(info.frames), "channels": int(info.channels), "size_bytes": path.stat().st_size}
 
     @staticmethod
     def _load_validated(path: Path, expected_sample_rate: int | None = None) -> tuple[Any, int] | None:
@@ -106,56 +86,31 @@ class ArticlePodcastRenderer:
             if info.frames <= 0 or info.channels <= 0 or (expected_sample_rate and sample_rate != expected_sample_rate):
                 return None
             audio = torch.from_numpy(data.T.copy())
-            if audio.numel() == 0:
-                return None
-            return audio, int(sample_rate)
+            return (audio, int(sample_rate)) if audio.numel() else None
         except Exception:
             return None
 
-    async def render(
-        self,
-        plan: PodcastPlan,
-        *,
-        language: str | None = None,
-        voice: str | None = None,
-        reference_audio: str | None = None,
-        synthesis_options: dict[str, Any] | None = None,
-        output_path: str | None = None,
-        checkpoint_store: SegmentCheckpointStore | None = None,
-        job_id: str | None = None,
-        artifact_dir: str | Path | None = None,
-    ) -> PodcastRenderResult:
-        """Render while reusing only checkpoints whose WAV artifact validates."""
+    async def render(self, plan: PodcastPlan, *, language: str | None = None, voice: str | None = None, reference_audio: str | None = None, synthesis_options: dict[str, Any] | None = None, output_path: str | None = None, checkpoint_store: SegmentCheckpointStore | None = None, job_id: str | None = None, artifact_dir: str | Path | None = None) -> PodcastRenderResult:
+        """Render and, for checkpointed jobs, persist validated reusable segments."""
         result = PodcastRenderResult(title=plan.title, status="completed", warnings=list(plan.warnings))
         audio_parts: list[Any] = []
+        checkpointed = checkpoint_store is not None and job_id is not None
 
         for segment in plan.segments:
-            checkpoint = checkpoint_store.get(job_id, segment.id) if checkpoint_store and job_id else None
-            reused = False
+            checkpoint = checkpoint_store.get(job_id, segment.id) if checkpointed else None
             if checkpoint and checkpoint.status == "completed" and checkpoint.artifact:
-                saved = checkpoint.artifact
-                saved_path = Path(saved.get("path", ""))
-                loaded = self._load_validated(saved_path, result.sample_rate)
+                loaded = self._load_validated(Path(checkpoint.artifact.get("path", "")), result.sample_rate)
                 if loaded is not None:
                     audio, sample_rate = loaded
                     result.sample_rate = result.sample_rate or sample_rate
                     audio_parts.append(audio)
-                    result.segments.append({"id": segment.id, "speaker": segment.speaker, "sample_rate": sample_rate, "samples": int(audio.shape[-1]), "artifact": saved, "resumed": True})
-                    reused = True
-            if reused:
-                continue
+                    result.segments.append({"id": segment.id, "speaker": segment.speaker, "sample_rate": sample_rate, "samples": int(audio.shape[-1]), "artifact": checkpoint.artifact, "resumed": True})
+                    continue
 
             try:
-                if checkpoint_store and job_id:
+                if checkpointed:
                     checkpoint_store.mark_running(job_id, segment.id)
-                artifact = await self.capabilities.synthesize(SynthesisRequest(
-                    text=segment.text,
-                    language=language,
-                    voice=voice or segment.speaker,
-                    reference_audio=reference_audio,
-                    direction=segment.direction,
-                    options=dict(synthesis_options or {}),
-                ))
+                artifact = await self.capabilities.synthesize(SynthesisRequest(text=segment.text, language=language, voice=voice or segment.speaker, reference_audio=reference_audio, direction=segment.direction, options=dict(synthesis_options or {})))
                 audio = artifact.get("audio") if isinstance(artifact, dict) else None
                 sample_rate = artifact.get("sample_rate") if isinstance(artifact, dict) else None
                 if audio is None or not sample_rate:
@@ -165,14 +120,15 @@ class ArticlePodcastRenderer:
                     result.sample_rate = sample_rate
                 elif sample_rate != result.sample_rate:
                     raise ValueError(f"Sample-rate mismatch: expected {result.sample_rate}, got {sample_rate}.")
-                persisted = self._persist_and_validate(self._segment_path(job_id or "standalone", segment.id, artifact_dir), audio, sample_rate)
-                checkpoint_artifact = {**persisted, "engine_id": artifact.get("engine_id") if isinstance(artifact, dict) else None, "model_id": artifact.get("model_id") if isinstance(artifact, dict) else None, "speaker": segment.speaker}
-                if checkpoint_store and job_id:
-                    checkpoint_store.mark_completed(job_id, segment.id, checkpoint_artifact)
+                persisted = None
+                if checkpointed:
+                    persisted = self._persist_and_validate(self._segment_path(job_id, segment.id, artifact_dir), audio, sample_rate)
+                    persisted.update({"engine_id": artifact.get("engine_id") if isinstance(artifact, dict) else None, "model_id": artifact.get("model_id") if isinstance(artifact, dict) else None, "speaker": segment.speaker})
+                    checkpoint_store.mark_completed(job_id, segment.id, persisted)
                 audio_parts.append(audio)
-                result.segments.append({"id": segment.id, "speaker": segment.speaker, "sample_rate": sample_rate, "samples": int(audio.shape[-1]), "artifact": checkpoint_artifact})
+                result.segments.append({"id": segment.id, "speaker": segment.speaker, "sample_rate": sample_rate, "samples": int(audio.shape[-1]), "artifact": persisted or artifact})
             except Exception as exc:
-                if checkpoint_store and job_id:
+                if checkpointed:
                     checkpoint_store.mark_failed(job_id, segment.id, str(exc))
                 result.status = "failed"
                 result.errors.append(f"Segment '{segment.id}' failed: {exc}")
