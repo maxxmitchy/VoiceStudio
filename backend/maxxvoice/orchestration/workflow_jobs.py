@@ -11,10 +11,10 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
 from uuid import uuid4
 
-from .jobs import InMemoryJobStore, JobStatus
+from .jobs import JobStatus
 
 
 class WorkflowJobError(RuntimeError):
@@ -51,13 +51,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class InMemoryWorkflowJobStore:
-    """Small injectable store used by the HTTP layer and tests.
+class WorkflowJobStore(Protocol):
+    """Minimal persistence contract required by the workflow runner."""
 
-    Persistence is intentionally not coupled to FastAPI. A SQLite/queue-backed
-    implementation can replace this store later without changing workflow
-    contracts.
-    """
+    def create(self, workflow: str, job_id: Optional[str] = None) -> WorkflowJob: ...
+    def get(self, job_id: str) -> Optional[WorkflowJob]: ...
+    def update(self, job: WorkflowJob) -> WorkflowJob: ...
+
+
+class InMemoryWorkflowJobStore:
+    """Small injectable store used by the HTTP layer and tests."""
 
     def __init__(self) -> None:
         self._jobs: Dict[str, WorkflowJob] = {}
@@ -76,6 +79,12 @@ class InMemoryWorkflowJobStore:
             raise WorkflowJobError(f"Unknown workflow job: {job_id}")
         return job
 
+    def update(self, job: WorkflowJob) -> WorkflowJob:
+        if job.id not in self._jobs:
+            raise WorkflowJobError(f"Unknown workflow job: {job.id}")
+        self._jobs[job.id] = job
+        return job
+
 
 RunnerCallable = Callable[[], Any | Awaitable[Any]]
 
@@ -83,7 +92,7 @@ RunnerCallable = Callable[[], Any | Awaitable[Any]]
 class MaxxVoiceWorkflowJobRunner:
     """Execute a high-level workflow while recording observable job state."""
 
-    def __init__(self, store: Optional[InMemoryWorkflowJobStore] = None) -> None:
+    def __init__(self, store: Optional[WorkflowJobStore] = None) -> None:
         self.store = store or InMemoryWorkflowJobStore()
 
     def create(self, workflow: str, job_id: Optional[str] = None) -> WorkflowJob:
@@ -115,6 +124,7 @@ class MaxxVoiceWorkflowJobRunner:
 
         job.status = JobStatus.RUNNING
         job.started_at = _now()
+        self.store.update(job)
 
         try:
             value = operation()
@@ -127,6 +137,7 @@ class MaxxVoiceWorkflowJobRunner:
             job.status = JobStatus.FAILED
         finally:
             job.completed_at = _now()
+            self.store.update(job)
 
         return job
 
