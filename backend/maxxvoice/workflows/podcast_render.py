@@ -2,10 +2,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from maxxvoice.capabilities import SynthesisRequest, VoiceCapabilityService
 from maxxvoice.workflows.article_podcast import PodcastPlan
+
+
+class SegmentCheckpointStore(Protocol):
+    """Minimal checkpoint contract; persistence remains outside the renderer."""
+
+    def mark_running(self, job_id: str, step_id: str) -> Any: ...
+
+    def mark_completed(
+        self, job_id: str, step_id: str, artifact: dict[str, Any] | None = None
+    ) -> Any: ...
+
+    def mark_failed(self, job_id: str, step_id: str, error: str) -> Any: ...
 
 
 @dataclass(slots=True)
@@ -79,8 +91,15 @@ class ArticlePodcastRenderer:
         reference_audio: str | None = None,
         synthesis_options: dict[str, Any] | None = None,
         output_path: str | None = None,
+        checkpoint_store: SegmentCheckpointStore | None = None,
+        job_id: str | None = None,
     ) -> PodcastRenderResult:
-        """Synthesize, assemble, QC and optionally publish a WAV artifact."""
+        """Synthesize, checkpoint, assemble, QC and optionally publish a WAV artifact.
+
+        Checkpoints record durable segment lifecycle state but do not yet imply
+        automatic resume: completed audio is only reusable once its artifact has
+        been persisted and independently validated by a recovery path.
+        """
         result = PodcastRenderResult(
             title=plan.title,
             status="completed",
@@ -89,6 +108,8 @@ class ArticlePodcastRenderer:
         audio_parts: list[Any] = []
 
         for segment in plan.segments:
+            if checkpoint_store and job_id:
+                checkpoint_store.mark_running(job_id, segment.id)
             try:
                 artifact = await self.capabilities.synthesize(
                     SynthesisRequest(
@@ -110,15 +131,30 @@ class ArticlePodcastRenderer:
                     raise ValueError(
                         f"Sample-rate mismatch: expected {result.sample_rate}, got {sample_rate}."
                     )
-                audio_parts.append(audio)
-                result.segments.append({
+                segment_info = {
                     "id": segment.id,
                     "speaker": segment.speaker,
                     "sample_rate": int(sample_rate),
                     "samples": int(audio.shape[-1]),
                     "artifact": artifact,
-                })
+                }
+                audio_parts.append(audio)
+                result.segments.append(segment_info)
+                if checkpoint_store and job_id:
+                    checkpoint_store.mark_completed(
+                        job_id,
+                        segment.id,
+                        {
+                            "speaker": segment.speaker,
+                            "sample_rate": int(sample_rate),
+                            "samples": int(audio.shape[-1]),
+                            "engine_id": artifact.get("engine_id") if isinstance(artifact, dict) else None,
+                            "model_id": artifact.get("model_id") if isinstance(artifact, dict) else None,
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001 — workflow boundary
+                if checkpoint_store and job_id:
+                    checkpoint_store.mark_failed(job_id, segment.id, str(exc))
                 result.status = "failed"
                 result.errors.append(f"Segment '{segment.id}' failed: {exc}")
                 break
