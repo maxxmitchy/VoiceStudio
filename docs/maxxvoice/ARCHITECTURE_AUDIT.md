@@ -2,11 +2,14 @@
 
 **Audit date:** 2026-09-12  
 **Repository:** `maxxmitchy/VoiceStudio`  
+**Primary downstream consumer:** `maxxmitchy/Wellivox-cAREFLUX-bUILD`  
 **Upstream:** VoiceStudio / previously OmniVoice-Studio
 
 ## Executive finding
 
 The fork is already a strong speech/media workstation rather than a thin TTS wrapper. The correct strategy is **evolution, not rewrite**: retain the mature engine/media infrastructure and add a clean MaxxVoice orchestration layer above it.
+
+MaxxVoice is being developed specifically so the resulting platform can become the **voice/media execution layer for Careflux/WelLivox**, while remaining reusable by other products. Careflux-specific clinical reasoning, patient-data selection and approval remain outside MaxxVoice.
 
 ## 1. Current architecture
 
@@ -33,50 +36,30 @@ The repository has a registry-oriented backend architecture. The engines area in
 This is an excellent seam for MaxxVoice: **do not make downstream products depend on individual model implementations.** They should call a stable capability interface.
 
 ### Media/audio
-The service layer already contains dedicated components for:
-- ASR
-- TTS
-- audio I/O/DSP
-- chunked TTS
-- audiobook generation
-- video dubbing
-- duration planning
-- dubbing QC
-- batch processing
-- capture/dictation
-- speaker/voice workflows
-
-The API router set also shows dedicated audiobook, batch, capture, dictation, dubbing, engine and other workflow boundaries.
+The service layer already contains dedicated components for ASR, TTS, audio I/O/DSP, chunked TTS, audiobook generation, video dubbing, duration planning, dubbing QC, batch processing, capture/dictation and speaker/voice workflows.
 
 ### AI/orchestration
 A particularly important existing component is `backend/services/director.py`. It already accepts natural-language delivery direction and converts it into a stable taxonomy covering energy, emotion, pace, intimacy and formality. It can use an LLM or deterministic heuristic fallback, and the resulting contract influences translation, TTS instruction and speech-rate planning.
 
-This means the repository already contains the beginnings of the **intelligence/orchestration layer** we want. MaxxVoice should expand this concept rather than invent it from scratch.
-
-### API/MCP
-The repository contains a dedicated `backend/mcp_server.py`, and the README documents REST/SSE/WebSocket interfaces, an OpenAI-compatible audio API and MCP. This gives MaxxVoice a natural machine-facing interface for agents and external applications.
-
-## 2. Important architectural observation
-
-The current codebase has a lot of product-specific terminology and historical `OmniVoice`/`VoiceStudio` naming, but the functional boundaries are much cleaner than the branding suggests.
-
-We should therefore separate:
+## 2. Product dependency direction
 
 ```text
-MAXXVOICE PLATFORM
-        |
-        +-- Orchestration / Agents
-        |
-        +-- Stable Capability API
-        |
-        +-- Existing Speech + Media Services
-        |
-        +-- Engine Registry / Adapters
-        |
-        +-- Models / Hardware / Workers
+Careflux / WelLivox
+       |
+       | approved, display-safe text + voice preferences
+       v
+MAXXVOICE API
+       |
+       +-- Workflow orchestration / durable jobs
+       +-- Stable capability contracts
+       +-- Existing VoiceStudio speech/media services
+       +-- Engine registry / adapters
+       +-- Models / hardware / workers
 ```
 
-Applications such as Careflux, Generix Global and educational/content products should consume the platform through the API/MCP layer rather than being embedded into the core.
+The important boundary is intentional: **Wellivox owns clinical context and decision-making; MaxxVoice owns voice/media presentation and execution.**
+
+The first concrete Careflux integration is `POST /maxxvoice/workflows/careflux-voice`, which accepts approved text and returns a durable job/progress contract. The endpoint explicitly does not perform clinical reasoning.
 
 ## 3. What we should preserve
 
@@ -94,100 +77,50 @@ Applications such as Careflux, Generix Global and educational/content products s
 - Existing CI/test infrastructure.
 - AGPL-3.0 license and upstream attribution obligations.
 
-## 4. What we should change gradually
+## 4. MaxxVoice foundation status
 
-### A. Branding boundary
-Introduce MaxxVoice branding/configuration without immediately deleting upstream names from implementation internals. Rename only after tests establish that the change is safe.
+### Stable capability layer
+`backend/maxxvoice/capabilities.py` provides `synthesize` and `transcribe` contracts. It resolves TTS/ASR through existing registries rather than individual model implementations.
 
-### B. Stable capability layer
-Create a platform-level capability contract such as:
+### Orchestration and durable jobs
+MaxxVoice has inspectable plans, durable SQLite workflow jobs, idempotency keys, API job status/progress, durable per-step checkpoints and validated WAV artifact persistence. Concurrent idempotent requests now use an atomic SQLite claim so only the creator dispatches work.
 
-- `synthesize`
-- `transcribe`
-- `clone_voice`
-- `design_voice`
-- `convert_voice`
-- `isolate_voice`
-- `diarize`
-- `dub`
-- `render_long_form`
-- `batch`
+### Resumability
+Article → Podcast segment artifacts are validated before checkpoint completion and can be reused after failure. Resume regenerates only missing/corrupt work and reassembles the final output from validated segments.
 
-The implementation should resolve capabilities through the existing engine registry.
+### Restart recovery
+Persisted jobs left in `running` state can be conservatively marked failed after process restart. They are not falsely reported as having continued execution; explicit resume remains the recovery action.
 
-**Phase 2 implementation status:** `backend/maxxvoice/capabilities.py` now provides the first stable `synthesize` and `transcribe` contracts. It delegates TTS resolution to `resolve_generation_backend()` and ASR resolution to `load_active_asr_backend()`, preserving existing availability checks, hardware routing, model lifecycle and fallback rules. The capability layer does not import individual model implementations.
+### Careflux voice workflow
+`backend/maxxvoice/workflows/careflux_voice.py` provides a presentation-only renderer for already approved Careflux text. It delegates speech generation to the existing capability layer and can persist a WAV artifact.
 
-### C. Orchestration layer
-Add a MaxxVoice orchestration service responsible for turning high-level user intent into one or more capability calls.
+## 5. Careflux/WelLivox integration contract
 
-**Phase 2B foundation:** `backend/maxxvoice/orchestration/planner.py` now defines an inspectable `Plan`/`PlanStep` contract and a deterministic first-pass planner. It recognizes synthesis, transcription, voice cloning/design intent and dubbing composition. The planner is deliberately side-effect free: it does not load models, download weights or execute jobs. This creates the stable planning seam that a future LLM planner can implement without changing execution contracts.
+The downstream Android application `maxxmitchy/Wellivox-cAREFLUX-bUILD` already has a strict AI boundary around authoritative data, privacy transformation, provider invocation and deterministic validation. MaxxVoice therefore should not bypass that architecture.
 
-**Phase 2C runtime foundation:** workflow jobs now have durable SQLite persistence, request payload retention and idempotency keys. Article → Podcast requests are represented as background jobs rather than blocking HTTP requests. Per-segment checkpoints are also persisted in `maxxvoice_workflow_steps`, recording pending/running/completed/failed state, timestamps and serializable artifact metadata. The API exposes aggregate progress and current segment state from the durable checkpoint store.
-
-These checkpoints are deliberately **not yet called crash-resumable execution**: completed waveform bytes are not currently treated as reusable recovery artifacts. The next runtime milestone is validated artifact persistence plus retry/resume of only incomplete segments.
-
-Example:
+The intended interaction is:
 
 ```text
-"Turn this article into a 7-minute podcast"
+Authoritative Wellivox data
         ↓
-Intent extraction
+Careflux AI Engine
         ↓
-Script planner
+privacy boundary + deterministic validation
         ↓
-Voice/casting decision
+approved display-safe message
         ↓
-TTS generation
+MaxxVoice Careflux Voice API
         ↓
-Per-segment checkpoints
+voice generation
         ↓
-Audio assembly/QC
+job status / audio artifact
         ↓
-Export
+Wellivox playback / user-facing experience
 ```
 
-### D. Agent/MCP layer
-Expose orchestration primitives through MCP so an AI agent can operate MaxxVoice as a tool rather than merely calling raw TTS.
+The Android project now contains a small `MaxxVoiceApiService` boundary and configurable `MAXXVOICE_BASE_URL`. No provider secrets are added to the Android client.
 
-## 5. Proposed MaxxVoice modules
-
-```text
-backend/maxxvoice/
-├── capabilities.py
-├── orchestration/
-│   ├── planner.py
-│   ├── jobs.py
-│   ├── workflow_jobs.py
-│   ├── sqlite_jobs.py
-│   ├── sqlite_workflow_steps.py
-│   ├── casting.py
-│   └── quality.py
-├── agents/
-│   ├── tools.py
-│   └── workflows.py
-├── projects/
-│   └── models.py
-└── api/
-    └── router.py
-```
-
-The exact directory layout should be adjusted after dependency inspection; the important point is the dependency direction, not the names.
-
-## 6. First product to build
-
-The best initial MaxxVoice product is not another generic voice generator. It is a **Voice/Audio Agent Workbench**:
-
-1. User gives a natural-language objective.
-2. MaxxVoice plans the work.
-3. It selects appropriate speech/media capabilities.
-4. It generates intermediate artifacts.
-5. User reviews/edits.
-6. MaxxVoice renders the final output.
-7. The same workflow is callable through API/MCP.
-
-This gives the project a differentiated reason to exist while preserving the upstream workstation.
-
-## 7. Priority roadmap
+## 6. Product roadmap
 
 ### Phase 1 — Audit
 - [x] Confirm repository fork and default branch.
@@ -199,40 +132,50 @@ This gives the project a differentiated reason to exist while preserving the ups
 
 ### Phase 2 — Safe foundation
 - [x] Add MaxxVoice capability contracts.
-- [x] Add orchestration package without changing existing workflows.
+- [x] Add orchestration package without replacing existing workflows.
 - [x] Add tests for capability validation and planner contract.
 - [ ] Wire health/status endpoint into application bootstrap.
 - [x] Add architecture documentation.
 - [x] Add durable workflow-job persistence.
-- [x] Add workflow idempotency support.
+- [x] Add atomic workflow idempotency support.
 - [x] Add API job-status/progress surface.
 - [x] Add durable per-segment checkpoints.
-- [ ] Add validated artifact persistence and true resumable execution.
+- [x] Add validated artifact persistence and resumable execution.
+- [x] Add conservative restart recovery.
 
 ### Phase 3 — Agent workflows
 - [ ] Script-to-audio workflow.
-- [x] Article-to-podcast planning and segmented audio execution foundation.
+- [x] Article-to-podcast planning and segmented audio execution.
 - [ ] Multi-speaker casting workflow.
 - [ ] Voice-directed generation.
 - [ ] Batch content factory.
 
-### Phase 4 — Product integrations
-- [ ] Careflux Voice adapter.
+### Phase 4 — Careflux/WelLivox product integration
+- [x] Careflux presentation-voice workflow contract.
+- [x] Android client API boundary.
+- [ ] Wellivox UI playback integration.
+- [ ] Wellivox job polling/state integration.
+- [ ] Authentication and trusted-server deployment contract.
+- [ ] Offline/queued voice requests where appropriate.
+- [ ] Careflux voice UX and accessibility pass.
+
+### Phase 5 — Other integrations
 - [ ] Generix medical-content adapter.
 - [ ] Educational/audiobook adapter.
 - [ ] External API/MCP integrations.
 
-## 8. Guardrails
+## 7. Guardrails
 
 - Do not replace functioning engines merely for branding.
-- Do not hard-code Careflux or other businesses into the core platform.
+- Do not hard-code Careflux clinical/business logic into the core speech engine.
+- Do not send raw patient records to MaxxVoice when approved presentation text is sufficient.
 - Do not expose arbitrary remote model installation through an unauthenticated API.
 - Do not assume all model weights share the AGPL license; preserve each model's upstream terms.
 - Maintain upstream attribution and AGPL-3.0 compliance.
 - Prefer additive commits with tests over large rewrites.
 
-## 9. Current conclusion
+## 8. Current conclusion
 
-**MaxxVoice should become the orchestration and agent layer over a mature local-first speech/media engine.**
+**MaxxVoice is now being shaped as the voice/media execution layer that Careflux/WelLivox can call, not as a separate generic TTS product.**
 
-The repository already provides most of the difficult low-level infrastructure. Our competitive work should therefore focus on intent, workflow planning, voice intelligence, automation, APIs/MCP, product integrations and an excellent user experience—not rebuilding TTS engines from zero.
+The immediate product goal is therefore to make the boundary reliable end-to-end: approved Careflux content → MaxxVoice job → speech artifact → Wellivox playback, while preserving the mature VoiceStudio engine room underneath.
