@@ -120,6 +120,8 @@ The implementation should resolve capabilities through the existing engine regis
 ### C. Orchestration layer
 Add a MaxxVoice orchestration service responsible for turning high-level user intent into one or more capability calls.
 
+**Phase 2B foundation:** `backend/maxxvoice/orchestration/planner.py` now defines an inspectable `Plan`/`PlanStep` contract and a deterministic first-pass planner. It recognizes synthesis, transcription, voice cloning/design intent and dubbing composition. The planner is deliberately side-effect free: it does not load models, download weights or execute jobs. This creates the stable planning seam that a future LLM planner can implement without changing execution contracts.
+
 Example:
 
 ```text
@@ -147,7 +149,7 @@ Expose orchestration primitives through MCP so an AI agent can operate MaxxVoice
 backend/maxxvoice/
 ├── capabilities.py       # Phase 2: stable synthesize/transcribe boundary
 ├── orchestration/
-│   ├── planner.py
+│   ├── planner.py        # Phase 2B: inspectable intent → plan
 │   ├── jobs.py
 │   ├── casting.py
 │   └── quality.py
@@ -157,7 +159,7 @@ backend/maxxvoice/
 ├── projects/
 │   └── models.py
 └── api/
-    └── router.py
+    └── router.py         # Side-effect-free status/plan HTTP boundary
 ```
 
 The exact directory layout should be adjusted after dependency inspection; the important point is the dependency direction, not the names.
@@ -188,9 +190,9 @@ This gives the project a differentiated reason to exist while preserving the ups
 
 ### Phase 2 — Safe foundation
 - [x] Add MaxxVoice capability contracts.
-- [ ] Add orchestration package without changing existing workflows.
-- [x] Add tests for capability validation and contract stability.
-- [ ] Add a health/status endpoint for MaxxVoice layer.
+- [x] Add orchestration package without changing existing workflows.
+- [x] Add tests for capability validation and planner contract.
+- [ ] Wire health/status endpoint into application bootstrap.
 - [x] Add architecture documentation.
 
 ### Phase 3 — Agent workflows
