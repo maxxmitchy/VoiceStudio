@@ -20,7 +20,6 @@ from maxxvoice.orchestration.sqlite_workflow_steps import SQLiteWorkflowStepStor
 from maxxvoice.workflows import ArticlePodcastPlanner, ArticlePodcastRenderer
 
 router = APIRouter(prefix="/maxxvoice", tags=["maxxvoice"])
-
 _db_path = os.getenv("MAXXVOICE_JOB_DB", ".data/maxxvoice_jobs.sqlite3")
 _artifact_dir = os.getenv("MAXXVOICE_ARTIFACT_DIR", ".data/maxxvoice_artifacts")
 _workflow_store = SQLiteWorkflowJobStore(_db_path)
@@ -47,15 +46,9 @@ class ArticlePodcastRequest(BaseModel):
 
 @router.get("/status")
 def status():
-    return {
-        "name": "MaxxVoice",
-        "version": "1",
-        "mode": "orchestration-foundation",
-        "job_store": "sqlite",
-        "step_checkpoints": "sqlite",
-        "segment_artifacts": "validated-wav",
-        "capabilities": VoiceCapabilityService.capabilities(),
-    }
+    return {"name": "MaxxVoice", "version": "1", "mode": "orchestration-foundation",
+            "job_store": "sqlite", "step_checkpoints": "sqlite", "segment_artifacts": "validated-wav",
+            "capabilities": VoiceCapabilityService.capabilities()}
 
 
 @router.post("/plan")
@@ -65,11 +58,9 @@ def plan(request: PlanRequest):
 
 def _build_plan(payload: dict):
     return ArticlePodcastPlanner().plan(
-        payload["article"],
-        title=payload.get("title", "Untitled Podcast"),
+        payload["article"], title=payload.get("title", "Untitled Podcast"),
         target_duration_minutes=payload.get("target_duration_minutes", 10.0),
-        narrator=payload.get("narrator", "narrator"),
-        chunk_words=payload.get("chunk_words", 120),
+        narrator=payload.get("narrator", "narrator"), chunk_words=payload.get("chunk_words", 120),
     )
 
 
@@ -77,18 +68,13 @@ async def _dispatch_article_podcast(job_id: str, podcast_plan) -> None:
     job = _workflow_store.get(job_id)
     if job is None:
         return
-    request_payload = job.payload
 
     async def operation():
         result = await ArticlePodcastRenderer().render(
-            podcast_plan,
-            language=request_payload.get("language"),
-            voice=request_payload.get("voice"),
-            reference_audio=request_payload.get("reference_audio"),
-            synthesis_options=request_payload.get("synthesis_options") or {},
-            checkpoint_store=_step_store,
-            job_id=job_id,
-            artifact_dir=_artifact_dir,
+            podcast_plan, language=job.payload.get("language"), voice=job.payload.get("voice"),
+            reference_audio=job.payload.get("reference_audio"),
+            synthesis_options=job.payload.get("synthesis_options") or {},
+            checkpoint_store=_step_store, job_id=job_id, artifact_dir=_artifact_dir,
         )
         payload = result.to_dict()
         payload["plan"] = podcast_plan.to_dict()
@@ -98,29 +84,25 @@ async def _dispatch_article_podcast(job_id: str, podcast_plan) -> None:
 
 
 @router.post("/workflows/article-podcast", status_code=http_status.HTTP_202_ACCEPTED)
-async def article_podcast(
-    request: ArticlePodcastRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-):
-    """Create an Article -> Podcast job and dispatch rendering in the background."""
+async def article_podcast(request: ArticlePodcastRequest,
+                          idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     normalized_key = idempotency_key.strip() if idempotency_key else None
-    if normalized_key:
-        existing = _workflow_store.get_by_idempotency_key("article-podcast", normalized_key)
-        if existing is not None:
-            return _job_response(existing)
-
     podcast_plan = _build_plan(request.model_dump(mode="json"))
-    job = _workflow_runner.create(
-        "article-podcast",
-        payload=request.model_dump(mode="json"),
-        idempotency_key=normalized_key,
-    )
+
+    if normalized_key:
+        job, created = _workflow_store.create_or_get(
+            "article-podcast", payload=request.model_dump(mode="json"), idempotency_key=normalized_key
+        )
+    else:
+        job = _workflow_runner.create("article-podcast", payload=request.model_dump(mode="json"))
+        created = True
 
     for segment in podcast_plan.segments:
         if _step_store.get(job.id, segment.id) is None:
             _step_store.upsert(WorkflowStepCheckpoint(job.id, segment.id))
 
-    if job.status is not JobStatus.QUEUED:
+    # Only the request that atomically created the job may dispatch it.
+    if not created or job.status is not JobStatus.QUEUED:
         return _job_response(job)
 
     asyncio.create_task(_dispatch_article_podcast(job.id, podcast_plan))
@@ -129,19 +111,17 @@ async def article_podcast(
 
 @router.post("/jobs/{job_id}/resume", status_code=http_status.HTTP_202_ACCEPTED)
 async def resume_workflow_job(job_id: str):
-    """Resume a failed Article -> Podcast job using only validated completed segments."""
     job = _workflow_store.get(job_id)
     if job is None:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Unknown workflow job: {job_id}")
+        raise HTTPException(status_code=404, detail=f"Unknown workflow job: {job_id}")
     if job.workflow != "article-podcast":
-        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Resume is currently supported for article-podcast jobs only.")
+        raise HTTPException(status_code=400, detail="Resume is currently supported for article-podcast jobs only.")
     if job.status is JobStatus.RUNNING:
         return _job_response(job)
     if job.status is JobStatus.COMPLETED:
         return _job_response(job)
     if job.status is not JobStatus.FAILED:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=f"Job is {job.status.value}; only failed jobs can be resumed.")
-
+        raise HTTPException(status_code=409, detail=f"Job is {job.status.value}; only failed jobs can be resumed.")
     podcast_plan = _build_plan(job.payload)
     job.status = JobStatus.QUEUED
     job.error = None
@@ -156,10 +136,9 @@ async def resume_workflow_job(job_id: str):
 
 @router.get("/jobs/{job_id}")
 def workflow_job(job_id: str):
-    """Return current job state plus durable segment progress."""
     job = _workflow_store.get(job_id)
     if job is None:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Unknown workflow job: {job_id}")
+        raise HTTPException(status_code=404, detail=f"Unknown workflow job: {job_id}")
     return _job_response(job)
 
 
@@ -170,10 +149,8 @@ def _job_response(job):
     total = len(steps)
     running = next((step.step_id for step in steps if step.status == "running"), None)
     payload["progress"] = {
-        "completed": completed,
-        "total": total,
+        "completed": completed, "total": total,
         "percent": round((completed / total) * 100, 1) if total else 100.0,
-        "current_step": running,
-        "steps": [step.to_dict() for step in steps],
+        "current_step": running, "steps": [step.to_dict() for step in steps],
     }
     return payload
