@@ -122,6 +122,10 @@ Add a MaxxVoice orchestration service responsible for turning high-level user in
 
 **Phase 2B foundation:** `backend/maxxvoice/orchestration/planner.py` now defines an inspectable `Plan`/`PlanStep` contract and a deterministic first-pass planner. It recognizes synthesis, transcription, voice cloning/design intent and dubbing composition. The planner is deliberately side-effect free: it does not load models, download weights or execute jobs. This creates the stable planning seam that a future LLM planner can implement without changing execution contracts.
 
+**Phase 2C runtime foundation:** workflow jobs now have durable SQLite persistence, request payload retention and idempotency keys. Article → Podcast requests are represented as background jobs rather than blocking HTTP requests. Per-segment checkpoints are also persisted in `maxxvoice_workflow_steps`, recording pending/running/completed/failed state, timestamps and serializable artifact metadata. The API exposes aggregate progress and current segment state from the durable checkpoint store.
+
+These checkpoints are deliberately **not yet called crash-resumable execution**: completed waveform bytes are not currently treated as reusable recovery artifacts. The next runtime milestone is validated artifact persistence plus retry/resume of only incomplete segments.
+
 Example:
 
 ```text
@@ -135,6 +139,8 @@ Voice/casting decision
         ↓
 TTS generation
         ↓
+Per-segment checkpoints
+        ↓
 Audio assembly/QC
         ↓
 Export
@@ -147,10 +153,13 @@ Expose orchestration primitives through MCP so an AI agent can operate MaxxVoice
 
 ```text
 backend/maxxvoice/
-├── capabilities.py       # Phase 2: stable synthesize/transcribe boundary
+├── capabilities.py
 ├── orchestration/
-│   ├── planner.py        # Phase 2B: inspectable intent → plan
+│   ├── planner.py
 │   ├── jobs.py
+│   ├── workflow_jobs.py
+│   ├── sqlite_jobs.py
+│   ├── sqlite_workflow_steps.py
 │   ├── casting.py
 │   └── quality.py
 ├── agents/
@@ -159,7 +168,7 @@ backend/maxxvoice/
 ├── projects/
 │   └── models.py
 └── api/
-    └── router.py         # Side-effect-free status/plan HTTP boundary
+    └── router.py
 ```
 
 The exact directory layout should be adjusted after dependency inspection; the important point is the dependency direction, not the names.
@@ -194,10 +203,15 @@ This gives the project a differentiated reason to exist while preserving the ups
 - [x] Add tests for capability validation and planner contract.
 - [ ] Wire health/status endpoint into application bootstrap.
 - [x] Add architecture documentation.
+- [x] Add durable workflow-job persistence.
+- [x] Add workflow idempotency support.
+- [x] Add API job-status/progress surface.
+- [x] Add durable per-segment checkpoints.
+- [ ] Add validated artifact persistence and true resumable execution.
 
 ### Phase 3 — Agent workflows
 - [ ] Script-to-audio workflow.
-- [ ] Article-to-podcast workflow.
+- [x] Article-to-podcast planning and segmented audio execution foundation.
 - [ ] Multi-speaker casting workflow.
 - [ ] Voice-directed generation.
 - [ ] Batch content factory.
